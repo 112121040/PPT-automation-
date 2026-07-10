@@ -1,13 +1,14 @@
 """
 Synergy Presentation Converter + Folder Watcher (Python)
-- Watches C:\SynergyPPTs\Inputs for new/changed .ppt/.pptx files
+- Watches C:\\SynergyPPTs\\Inputs for new/changed .ppt/.pptx files
 - Converts each deck onto the SynergyMaster template
-- Saves branded output to C:\SynergyPPTs\Outputs
-Run:  python synergy_convert.py          (watch mode, keeps running)
-      python synergy_convert.py --once   (single conversion run, then exit)
+- Saves branded output to C:\\SynergyPPTs\\Outputs
+Run:  py synergy_convert.py          (watch mode, keeps running)
+      py synergy_convert.py --once   (single conversion run, then exit)
 """
 
 import os
+import re
 import sys
 import time
 import logging
@@ -51,8 +52,17 @@ logging.basicConfig(
 log = logging.getLogger("synergy")
 
 
+class PowerPointDead(RuntimeError):
+    """Raised when the COM connection to PowerPoint is lost."""
+
+
+def is_rpc_dead(err) -> bool:
+    s = str(err)
+    return "RPC server is unavailable" in s or "-2147023174" in s
+
+
 # ---------------- helpers ----------------
-def find_template() -> Path | None:
+def find_template():
     for name in TEMPLATES:
         p = BASE_DIR / name
         if p.exists():
@@ -77,7 +87,6 @@ def para_font_size(shape, default=12.0) -> float:
 
 
 def strip_numbering(text: str) -> str:
-    import re
     return re.sub(r"^\s*\d+[\.\)]\s*", "", text)
 
 
@@ -102,6 +111,12 @@ def set_template_fonts(shape, is_title: bool):
                     cf.Name, cf.Color.RGB = BODY_FONT, BLACK_BGR
     except Exception:
         pass
+
+
+def new_powerpoint():
+    """Start a PRIVATE PowerPoint instance (DispatchEx) so closing a user's
+    PowerPoint window never kills the converter's connection."""
+    return win32com.client.DispatchEx("PowerPoint.Application")
 
 
 # ---------------- core conversion ----------------
@@ -142,10 +157,7 @@ def convert_file(app, template: Path, input_file: Path, output_file: Path) -> bo
             if slide.SlideIndex == 1 and "Title Slide" in brand:
                 target = brand["Title Slide"]
             else:
-                base = slide.CustomLayout.Name
-                base = strip_numbering(base) if False else base
-                import re
-                base = re.sub(r"^\d+_", "", base)
+                base = re.sub(r"^\d+_", "", slide.CustomLayout.Name)
                 if base in brand and base != "Title Slide":
                     target = brand[base]
                 elif "Title and Content" in brand:
@@ -154,7 +166,7 @@ def convert_file(app, template: Path, input_file: Path, output_file: Path) -> bo
                 try: slide.CustomLayout = target
                 except Exception: pass
 
-        # --- REBUILD Title Slide slides: text only, navy design ---
+        # --- REBUILD Title Slide slides: text only, branded design ---
         for slide in doc.Slides:
             if slide.CustomLayout.Name != "Title Slide":
                 continue
@@ -188,6 +200,8 @@ def convert_file(app, template: Path, input_file: Path, output_file: Path) -> bo
                     sf = sub.TextFrame.TextRange.Font
                     sf.Name, sf.Size, sf.Color.RGB = BODY_FONT, 16, WHITE_BGR
             except Exception as e:
+                if is_rpc_dead(e):
+                    raise
                 log.warning(f"  title-slide rebuild issue: {e}")
 
         # --- remove old heading bars (wide, short, top, textless) ---
@@ -289,6 +303,8 @@ def convert_file(app, template: Path, input_file: Path, output_file: Path) -> bo
                     except Exception:
                         pass
             except Exception as e:
+                if is_rpc_dead(e):
+                    raise
                 log.warning(f"  title promotion issue on slide {slide.SlideIndex}: {e}")
 
         # --- delete empty placeholders (titles + 'Click to add text') ---
@@ -329,6 +345,9 @@ def convert_file(app, template: Path, input_file: Path, output_file: Path) -> bo
         return True
 
     except Exception as e:
+        if is_rpc_dead(e):
+            log.error(f"  FAILED {input_file.name}: PowerPoint connection lost — restarting")
+            raise PowerPointDead() from e
         log.error(f"  FAILED {input_file.name}: {e}")
         return False
     finally:
@@ -359,14 +378,37 @@ def convert_all() -> None:
     app = None
     ok = fail = 0
     try:
-        app = win32com.client.Dispatch("PowerPoint.Application")
+        app = new_powerpoint()
         for f in sorted(files):
             log.info(f"Processing: {f.name}")
             out = OUTPUTS / (f.stem + ".pptx")
-            if convert_file(app, template, f, out):
-                ok += 1
-            else:
-                fail += 1
+            try:
+                if convert_file(app, template, f, out):
+                    ok += 1
+                else:
+                    fail += 1
+            except PowerPointDead:
+                # PowerPoint died - restart a fresh instance and retry this file once
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+                try:
+                    app = new_powerpoint()
+                except Exception as e:
+                    log.error(f"Could not restart PowerPoint: {e}")
+                    fail += 1
+                    break
+                log.info(f"  retrying: {f.name}")
+                try:
+                    if convert_file(app, template, f, out):
+                        ok += 1
+                    else:
+                        fail += 1
+                except PowerPointDead:
+                    log.error(f"  FAILED {f.name}: PowerPoint unstable — aborting batch")
+                    fail += 1
+                    break
     finally:
         if app is not None:
             try: app.Quit()
@@ -418,7 +460,10 @@ def watch() -> None:
             log.info(f"Detected: {', '.join(new_or_changed)}")
             for name in new_or_changed:
                 file_ready(INPUTS / name)
-            convert_all()
+            try:
+                convert_all()
+            except Exception as e:
+                log.error(f"Batch error: {e}")
             seen = snapshot()
         else:
             seen = now
